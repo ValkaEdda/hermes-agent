@@ -1,10 +1,12 @@
 """Tests for the Hermes plugin system (hermes_cli.plugins)."""
 
-import logging
 import json
+import logging
+import queue
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -769,6 +771,23 @@ class TestThreadToolWhitelist:
 
 class TestPluginContext:
     """Tests for the PluginContext facade."""
+
+    def test_inject_message_for_session_rejects_stale_origin(self):
+        manager = PluginManager()
+        manager._cli_ref = SimpleNamespace(
+            session_id="active-session",
+            _agent_running=False,
+            _pending_input=queue.Queue(),
+            _interrupt_queue=queue.Queue(),
+        )
+        context = PluginContext(
+            PluginManifest(name="return-test", source="bundled"), manager
+        )
+
+        assert not context.inject_message_for_session("stale-session", "wrong")
+        assert manager._cli_ref._pending_input.empty()
+        assert context.inject_message_for_session("active-session", "continue")
+        assert manager._cli_ref._pending_input.get_nowait() == "continue"
 
 
 

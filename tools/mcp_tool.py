@@ -236,6 +236,9 @@ if not _MCP_AVAILABLE:
     logger.debug("mcp package not installed -- MCP tool support disabled")
 
 ClientSession: Any = None
+ConduitClientSession: Any = None
+ConduitDecisionReturnNotification: Any = None
+decision_return_bridge: Any = None
 _MCP_SDK_IMPORT_ATTEMPTED = False
 _MCP_SDK_IMPORT_LOCK = threading.Lock()
 
@@ -250,7 +253,7 @@ _MCP_SDK_LAZY_SYMBOLS = frozenset({
     "CreateMessageResult", "CreateMessageResultWithTools", "ErrorData",
     "SamplingCapability", "SamplingToolsCapability", "TextContent",
     "ToolUseContent", "ElicitRequestParams", "ElicitResult",
-    "ServerNotification", "ToolListChangedNotification",
+    "ToolListChangedNotification",
     "PromptListChangedNotification", "ResourceListChangedNotification",
 })
 
@@ -279,12 +282,14 @@ def _ensure_mcp_sdk() -> bool:
     global _MCP_MESSAGE_HANDLER_SUPPORTED, _MCP_LOGGING_CALLBACK_SUPPORTED
     global _MCP_NEW_HTTP, LATEST_PROTOCOL_VERSION, sse_client
     global ClientSession, StdioServerParameters, stdio_client
+    global ConduitClientSession, ConduitDecisionReturnNotification
+    global decision_return_bridge
     global streamablehttp_client, streamable_http_client
     global CreateMessageResult, CreateMessageResultWithTools, ErrorData
     global SamplingCapability, SamplingToolsCapability, TextContent, ToolUseContent
     global ElicitRequestParams, ElicitResult
-    global ServerNotification, ToolListChangedNotification
-    global PromptListChangedNotification, ResourceListChangedNotification
+    global ToolListChangedNotification, PromptListChangedNotification
+    global ResourceListChangedNotification
 
     if not _MCP_AVAILABLE:
         return False
@@ -346,7 +351,6 @@ def _ensure_mcp_sdk() -> bool:
             # Notification types for dynamic tool discovery (tools/list_changed)
             try:
                 from mcp.types import (
-                    ServerNotification,
                     ToolListChangedNotification,
                     PromptListChangedNotification,
                     ResourceListChangedNotification,
@@ -354,6 +358,11 @@ def _ensure_mcp_sdk() -> bool:
                 _MCP_NOTIFICATION_TYPES = True
             except ImportError:
                 logger.debug("MCP notification types not available -- dynamic tool discovery disabled")
+            from tools.conduit_decision_return import (
+                ConduitClientSession,
+                ConduitDecisionReturnNotification,
+                decision_return_bridge,
+            )
         except ImportError:
             logger.debug("mcp package not installed -- MCP tool support disabled")
 
@@ -385,6 +394,14 @@ def _check_message_handler_support() -> bool:
         return "message_handler" in inspect.signature(ClientSession).parameters
     except (TypeError, ValueError):
         return False
+
+
+def _mcp_client_session_class(config: dict):
+    """Select the extended client only for an explicit boolean opt-in."""
+    _ensure_mcp_sdk()
+    if config.get("decision_return") is True and ConduitClientSession is not None:
+        return ConduitClientSession
+    return ClientSession
 
 
 def _check_logging_callback_support() -> bool:
@@ -2285,8 +2302,16 @@ class MCPServerTask:
                 if isinstance(message, Exception):
                     logger.debug("MCP message handler (%s): exception: %s", self.name, message)
                     return
-                if _MCP_NOTIFICATION_TYPES and isinstance(message, ServerNotification):
-                    match message.root:
+                root = getattr(message, "root", None)
+                if (
+                    self._config.get("decision_return") is True
+                    and ConduitDecisionReturnNotification is not None
+                    and isinstance(root, ConduitDecisionReturnNotification)
+                ):
+                    await decision_return_bridge.handle_notification(self, root)
+                    return
+                if _MCP_NOTIFICATION_TYPES:
+                    match root:
                         case ToolListChangedNotification():
                             logger.info(
                                 "MCP server '%s': received tools/list_changed notification",
@@ -2749,7 +2774,7 @@ class MCPServerTask:
                         for _pid in new_pids:
                             _stdio_pids[_pid] = self.name
                         _stdio_pgids.update(new_pgids)
-                async with ClientSession(
+                async with _mcp_client_session_class(config)(
                     read_stream, write_stream, **sampling_kwargs
                 ) as session:
                     # Bound the MCP handshake. A stdio server that never
@@ -2771,6 +2796,8 @@ class MCPServerTask:
                     )
                     self.session = session
                     self._mark_lifecycle_started()
+                    if config.get("decision_return") is True:
+                        await decision_return_bridge.reconcile(self)
                     await self._discover_tools()
                     self._ready.set()
                     # Session is live again: clear any breaker state from a
@@ -3121,7 +3148,7 @@ class MCPServerTask:
                 _sse_kwargs["httpx_client_factory"] = _mcp_http_client_factory
             try:
                 async with sse_client(**_sse_kwargs) as (read_stream, write_stream):
-                    async with ClientSession(
+                    async with _mcp_client_session_class(config)(
                         read_stream, write_stream, **sampling_kwargs
                     ) as session:
                         # Bound the handshake — same orphaned-task hang as the
@@ -3132,6 +3159,8 @@ class MCPServerTask:
                             session.initialize(), timeout=float(connect_timeout)
                         )
                         self.session = session
+                        if config.get("decision_return") is True:
+                            await decision_return_bridge.reconcile(self)
                         await self._discover_tools()
                         self._ready.set()
                         # Session is live again: clear any breaker state from a
@@ -3185,12 +3214,14 @@ class MCPServerTask:
                     async with streamable_http_client(url, http_client=http_client) as (
                         read_stream, write_stream, _get_session_id,
                     ):
-                        async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
+                        async with _mcp_client_session_class(config)(read_stream, write_stream, **sampling_kwargs) as session:
                             # Bound the handshake (#59349) — see stdio path.
                             self.initialize_result = await asyncio.wait_for(
                                 session.initialize(), timeout=float(connect_timeout)
                             )
                             self.session = session
+                            if config.get("decision_return") is True:
+                                await decision_return_bridge.reconcile(self)
                             await self._discover_tools()
                             self._ready.set()
                             # Session is live again: clear any breaker state from
@@ -3232,12 +3263,14 @@ class MCPServerTask:
                 async with streamablehttp_client(url, **_http_kwargs) as (
                     read_stream, write_stream, _get_session_id,
                 ):
-                    async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
+                    async with _mcp_client_session_class(config)(read_stream, write_stream, **sampling_kwargs) as session:
                         # Bound the handshake (#59349) — see stdio path.
                         self.initialize_result = await asyncio.wait_for(
                             session.initialize(), timeout=float(connect_timeout)
                         )
                         self.session = session
+                        if config.get("decision_return") is True:
+                            await decision_return_bridge.reconcile(self)
                         await self._discover_tools()
                         self._ready.set()
                         # Session is live again: clear any breaker state from a
@@ -5411,6 +5444,20 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     result = await server.session.call_tool(tool_name, arguments=args)
                 finally:
                     server._pending_call_context = None
+            if (
+                getattr(server, "_config", {}).get("decision_return") is True
+                and decision_return_bridge is not None
+            ):
+                registered_decision_id = decision_return_bridge.register_tool_result(
+                    server_name=server_name,
+                    tool_name=tool_name,
+                    session_id=str(kwargs.get("session_id") or ""),
+                    result=result,
+                )
+                if registered_decision_id is not None:
+                    await decision_return_bridge.reconcile_decision(
+                        server, registered_decision_id
+                    )
             # The RPC round-trip completed — the session is demonstrably
             # healthy at the transport level (even if the tool itself
             # returned isError). Clear the rapid-drop budget (#62212).

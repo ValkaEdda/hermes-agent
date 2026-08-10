@@ -1,0 +1,6 @@
+name: conduit-decision-return
+version: 0.1.0
+description: "Resume the exact Hermes CLI session when an originated Conduit Decision returns from human custody."
+author: "Conduit"
+hooks:
+  - on_session_finalize
